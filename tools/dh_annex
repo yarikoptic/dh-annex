@@ -1,0 +1,235 @@
+#!/usr/bin/python
+#emacs: -*- mode: python-mode; py-indent-offset: 4; tab-width: 4; indent-tabs-mode: nil -*- 
+#ex: set sts=4 ts=4 sw=4 noet:
+"""
+
+ COPYRIGHT: Yaroslav Halchenko 2016
+
+ LICENSE: MIT
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in
+  all copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+  THE SOFTWARE.
+"""
+
+import re
+import os
+from debian import deb822
+
+from os.path import join as opj, basename
+
+from datalad.consts import ARCHIVES_SPECIAL_REMOTE
+from datalad.utils import chpwd, find_files
+from datalad.support.annexrepo import AnnexRepo
+
+# might not need any pipelining and just use functionality from api
+from datalad.crawler.nodes.annex import Annexificator
+from datalad.crawler.pipeline import run_pipeline
+from datalad.crawler.nodes.misc import find_files as find_files_node
+
+# leaves in ultimatedb branch -- may be will fish it out sooner than later now
+from datalad.support.digests import Digester
+
+__author__ = 'Yaroslav Halchenko'
+__copyright__ = 'Copyright (c) 2016 Yaroslav Halchenko'
+__license__ = 'MIT'
+
+
+# could be done in bash
+# TODO?  This way is quite expensive since we would reprocess the same
+# archives for each release... to migigate we will enhance to add some kind
+# of a db which would simply list and store under debian/processed_archives
+# the list of keys which were already processed
+def process_archives(archives_re=None):
+    # using datalad, traverse the tree outside of debian/
+    # process all archives within some temporary branch
+    # which would adjust git-annex branch to point to content
+    # within archives
+
+    # run pipeline which would create temp branch
+    annex = Annexificator(
+        special_remotes=[ARCHIVES_SPECIAL_REMOTE]
+    )
+    temp_branch = 'dl_annex_archives'
+    #TODO  we need a db, but it could simply be a DB which would record
+    # to which key a given file pointed, so if key changes, we need to
+    # re-extract etc
+    # do we actually need a pipeline really?
+    # we should be able to do it in a single loop anyways
+    pipeline = [
+        # with remove_after_done we shouldn't need it even!
+        #annex.switch_branch(temp_branch, must_exist=False),
+        # and if debian branch is merging upstream, we don't need to checkout anything
+        #annex.merge_branch('debian', strategy='theirs', commit=False),
+        [
+            find_files_node(archives_re, fail_if_none=True),
+            #TODO resolve_file_to_key
+            annex.add_archive_content(
+                existing='archive-suffix',
+                allow_dirty=True,  # defaults
+                commit=False,      # defaults
+                strip_leading_dirs=False,
+                remove_after_done=True, # TODO
+            ),
+            #TODO record_key_in_db
+        ],
+        # TODO: shoot -- we need to clean up after ourselves somehow
+        # so we could get back to debian, but without removing anything
+        # else what is not under git/annex control or was modified
+        # HOW  may be above add_archive_content could have option to
+        # simply git rm -rf extracted directory after it is done adding
+        # to annex!?
+        # Actually why bother?  we just need to reset --hard and clean
+        # aggressively -- Annexificator above should first check that
+        # there is nothing uncommitted (so this action should be before
+        # anything is done by debian tools???? unlikely...)
+        #annex.switch_branch('debian'),  # should be doable after cleanup
+        #annex.remove_branch(temp_branch) # TODO
+    ]
+    out = run_pipeline(pipeline)
+    print out
+
+
+# could be done in bash
+def get_first_binarypackage():
+    for d in deb822.Deb822.iter_paragraphs(open('debian/control')):
+        if 'Package' in d:
+            return d['Package']
+    return None
+
+#  this one would be trickier in bash
+def get_all_checksums(gitdir='.git'):
+    """Return, per each digest algorithm, per each known to annex digest return a key path to a file under .git/annex
+
+    {checksum: (backend, key path?)}
+
+    even though backend is duplicate in the key, doesn't hurt much but would be more convenient
+    key is actually used primarily for checking
+
+    we could actually do not bother with backend, and just provide full path to the key
+    and create a symlink instead of running 'git annex add', which would be much faster...
+    and then rely/hope that we don't screw up in terms of annex object store version etc
+    """
+    KEY_REGEX = re.compile('^(?P<backend>(?P<digest>\S+?)E?)(-\S+)*--(?P<checksum>[^.]*)(\.\S*)*?$')
+    len_gitdir = len(gitdir.rstrip('\/'))
+    out = {}
+    for fpath in find_files('.*', opj(gitdir, 'annex', 'objects'), exclude_vcs=False):
+        key = basename(fpath)
+        # should be of a known form
+        res = KEY_REGEX.match(key)
+        if not res:
+            raise RuntimeError("Could not match format of %s" % key)
+        d = res.groupdict()
+        assert '.' not in d['checksum']
+        out[d['checksum']] = (d['backend'], fpath[len_gitdir+1:])
+    return out
+
+
+def test_smoke_get_all_checksums():
+    import pprint
+    pprint.pprint(get_all_checksums('/home/yoh/deb/gits/pkg-exppsy/freesurfer-upstream/.git'))
+
+
+if False: #__name__ == '__main__':
+    # get opts
+    #  process_archives  regexp
+    # process archives
+    class opts:
+        process_archives = '.*\.(tar(\..{,5}*|zip)'
+    if opts.process_archives:
+        process_archives(opts.process_archives)
+    repodir = '.'
+
+    digest_algos = [x.lower().rstrip('e')
+                    for x in AnnexRepo(repodir).annex_repo_info()['backend usage'].keys()]
+    assert not digest_algos.difference({'sha1', 'md5', 'sha256', 'sha512'})
+
+    # obtain the dictionary of
+    # digest_algo: { digest -> path_to_key }
+    checksums = get_all_checksums()
+
+    pkg_installdir = 'debian/tmp'  # TODO -- change to the correct one
+    if not os.exists(pkg_installdir):
+        # must be after the first package name
+        pkg_installdir = opj('debian', get_first_binarypackage())
+
+    # TODO: would be lower in the hierarchy, e.g. somewhere like + 'usr/lib/freesurfer'
+    pkg_repodir = pkg_installdir
+
+    # TODO: we need to initiate empty git-annex repo under specified (where?) location
+    repo = AnnexRepo(pkg_repodir)
+    # TODO: fetch into it only git-annex branch from the main repo
+    #       (see below the command)
+    #       may be could be done even at later point
+
+    # go to the topdir, go through all files and
+    digester = Digester(digest_algos)
+    with chpwd(pkg_repodir):
+        for f in find_files('.*', topdir=pkg_repodir):
+            digests = digester(f)
+            for algo, digest in digests.items():
+                if digest in checksums[algo]:
+                    backend, key = checksums[algo]
+                    # so we have this file under annex
+                    # replace with a symlink to .git/annex
+                    # actually we might just do git-annex add by using an matching backend?
+                    repo.add_to_annex(f, backend=backend)
+                    key_ = repo.get_file_key(f)
+                    assert(key == key_)
+                    raise NotImplementedError('TODO')
+                    break
+
+    # TODO: git repack etc
+
+    # TODO: inject all necessary pieces into maintainer scripts which would:
+
+    # TODO: upon installation, fresh or old repo? should be initiated
+    # git-annex branch fetched  git remote add original; git fetch original git-annex 
+    # and all annexed files added to it  find -lname *.git/annex* | xargs git add
+    # then annex could fetch them without problem
+    # ??? may be persistent branch would indeed be better... not yet sure
+    # ???? or if we just ship that .git, and take care about renaming/removing
+    # previous copy which would have .git/objects and whatnot (but not .git/annex/objects)
+    # modified, then we could probably just deploy the new one, invoke git annex fsck;
+    # to recover what might already be available and then git annex get  to get the rest
+    # datalad clean at the end
+    # TODO: depending on configuration we might want to dropunused 
+    
+
+"""
+# debhelper:  upon installation of content with broken symlinks we
+cd pkg_repodir
+rm -f .git/annex/objects;
+#git rm -rf .git
+#git init; git annex init
+# We will keep the persistent storage of keys
+ln -s /var/lib/package/annex/objects .git/annex/objects
+
+# add shipped symlinks to annex into git
+#find -type l -lname *.git/annex/* | xargs git add
+
+# ACTUALLY -- let's just ship the repo straight within, we should just drop all the load etc
+# and
+#git remote add  /var/lib/package/annex/repo upgrade  # so that repo should be the repo we ship in pkg
+#git fetch upgrade git-annex
+# possibly add few other remotes with git-annex branches under given names?
+# TODO: check if we need sync/merge with them somehow
+
+# establish within annex knowledge about present ones within the persisten storage
+git annex fsck --fast --quiet 2>&1 | grep -v -e 'No known' -e 'git-annex.*fsck.*failed'
+git annex get --quiet .
+"""

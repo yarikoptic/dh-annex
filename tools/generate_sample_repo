@@ -1,0 +1,93 @@
+#!/bin/bash
+
+set -eu
+
+# just a sample script to generate a test/trial repository
+# which I could work with quickly and which would be git-annex repo
+
+odir=datatune-orig
+tdir=datatune
+rhost=washoe
+rpath=~/www/tmp/datatune.git
+
+git-sedi() {
+ git grep -l $1 | xargs sed -i -e "s/$1/$2/g"
+}
+
+if [ -e $odir ]; then
+ chmod +w -R $odir
+ rm -rf $odir
+fi
+
+rsync -a -L ~/proj/svgtune/ $odir
+cd $odir
+
+git checkout master
+git-sedi svgtune datatune  # so we have new name all around
+git mv svgtune datatune
+git commit -m 'renamed all shebang to datatune' -a
+
+echo "123" > 123.dat
+mkdir -p data/deep
+echo "deep" > data/deep/deep-data.dat
+git annex init
+git annex add 123.dat data/deep/deep-data.dat
+
+# create some archives
+
+for a in arch1 arch2; do 
+  mkdir $a
+  for f in a b; do
+   echo "data $a for $f" > $a/$f;
+  done 
+  tar -czf $a.tgz $a
+  rm -rf $a
+  git annex add $a.tgz
+done
+
+git commit -m 'added some files to annex' -a
+git tag -a -m "bogus upstream tag" upstream/999.0.0
+
+git checkout debian
+git merge --no-edit master
+git-sedi svgtune datatune
+git-sedi PREFIX DESTDIR
+cat >| debian/rules <<EOF
+#!/usr/bin/make -f
+
+%:
+	dh \$@
+
+override_dh_auto_install:
+	dh_auto_install
+	install -m 0644 -D 123.dat debian/datatune/usr/lib/datatune/data/123.dat
+	install -m 0644 -D data/deep/deep-data.dat debian/datatune/usr/lib/datatune/data/deep/deep-data.dat
+	cd debian/datatune/usr/lib/datatune/data; tar -xzvf \$(CURDIR)/arch1.tgz
+	cd debian/datatune/usr/lib/datatune/data; tar -xzvf \$(CURDIR)/arch2.tgz
+EOF
+
+git commit -m "renamed all to datatune in debian" -a
+
+dch --noconf  -v '1.0.0-1' "Initiated a new matching debian changelog" 
+git commit -m "added changelog entry for debian" -a
+
+# now publish it
+ssh $rhost "rm -rf $rpath; mkdir $rpath; cd $rpath; git init --bare --shared; mv hooks/post-update.sample hooks/post-update"
+git remote add publish $rhost:$rpath
+git fetch publish
+git push publish master git-annex debian
+git push --tags publish 
+git annex copy --to=publish .
+
+cd ..
+if [ -e $tdir ]; then
+    chmod a+w -R $tdir; rm -rf $tdir
+fi
+git clone $rhost:$rpath $tdir
+cd $tdir
+git annex get .
+git checkout debian
+fakeroot debian/rules binary
+
+# TODO: mkdir -p debian/source
+# TODO: echo '3.0 (git)' >| debian/options/format

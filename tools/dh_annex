@@ -3,7 +3,7 @@
 #ex: set sts=4 ts=4 sw=4 noet:
 """
 
- COPYRIGHT: Yaroslav Halchenko 2016
+ COPYRIGHT: Yaroslav Halchenko 2016-2018
 
  LICENSE: MIT
 
@@ -27,7 +27,7 @@
 """
 
 import re
-import os
+import os, os.path as op
 from debian import deb822
 
 from os.path import join as opj, basename
@@ -43,6 +43,15 @@ from datalad.crawler.nodes.misc import find_files as find_files_node
 
 # leaves in ultimatedb branch -- may be will fish it out sooner than later now
 from datalad.support.digests import Digester
+
+import logging
+lgr = logging.getLogger('dh-annex')
+# Rudimentary logging support.  If you want it better -- we need to have
+# more than one file otherwise it is not manageable
+logging.basicConfig(
+    format='%(levelname)s: %(message)s',
+    level=getattr(logging, os.environ.get('DHANNEX_LOGLEVEL', 'INFO'))
+)
 
 __author__ = 'Yaroslav Halchenko'
 __copyright__ = 'Copyright (c) 2016 Yaroslav Halchenko'
@@ -154,8 +163,9 @@ if False: #__name__ == '__main__':
         process_archives(opts.process_archives)
     repodir = '.'
 
+	annex_repo_info = AnnexRepo(repodir).annex_repo_info()
     digest_algos = [x.lower().rstrip('e')
-                    for x in AnnexRepo(repodir).annex_repo_info()['backend usage'].keys()]
+                    for x in annex_repo_info['backend usage'].keys()]
     assert not digest_algos.difference({'sha1', 'md5', 'sha256', 'sha512'})
 
     # obtain the dictionary of
@@ -167,7 +177,7 @@ if False: #__name__ == '__main__':
         # must be after the first package name
         pkg_installdir = opj('debian', get_first_binarypackage())
 
-    # TODO: would be lower in the hierarchy, e.g. somewhere like + 'usr/lib/freesurfer'
+    # TODO: would be deeper in the hierarchy, e.g. somewhere like + 'usr/lib/freesurfer'
     pkg_repodir = pkg_installdir
 
     # TODO: we need to initiate empty git-annex repo under specified (where?) location
@@ -233,3 +243,52 @@ ln -s /var/lib/package/annex/objects .git/annex/objects
 git annex fsck --fast --quiet 2>&1 | grep -v -e 'No known' -e 'git-annex.*fsck.*failed'
 git annex get --quiet .
 """
+
+
+# 1. get a branch per release/architecture  e.g.  debian-builds/stretch1/amd64
+
+def install_repo(
+        url,
+        path,
+        version=None,
+        get_files=None,
+        get_meta=None,
+        add_remotes=None,
+        allow_upgrade=True,
+        remote='origin'
+        # links
+):
+
+    from datalad.api import install, Dataset
+    lgr.info("Installing %s under %s", url, path)
+    if op.lexists(path):
+        lgr.info("Dataset was previously installed, fetching updates")
+        ds = Dataset(path=path)
+        lgr.debug(ds.update(sibling=remote))
+    else:
+        ds = install(source=url, path=path)
+
+    if version:
+        try:
+            ds.repo.checkout(version)
+        except Exception as exc:
+            import pdb; pdb.set_trace()
+            lgr.error(
+                "Failed to checkout version %s. Known tags are: %s",
+                version, ', '.join(ds.repo.get_tags())
+            )
+            raise
+
+    if not get_files and not get_meta:
+        get_files = '.'  # get all files for the repo
+    if get_files:
+        ds.get(get_files)
+    if get_meta:
+        raise NotImplementedError(
+            "yet to implement fetching by metadata tags.  Eventually those all "
+            "might come as a part of the package specification")
+
+
+if __name__ == '__main__':
+    import sys
+    install_repo(*sys.argv[1:])
